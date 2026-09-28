@@ -66,13 +66,13 @@ Storage: SHA-256 hash only (never store plain key); `keyPrefix` keeps the first 
 ```
 
 Every key minted through the API-keys endpoints uses that format. The bootstrap seed key is the only
-exception: an explicit `API_MASTER_KEY` is taken verbatim, and `ALLOW_DEV_API_KEY=true` opts into the
+exception: an explicit `API_MASTER_KEY` is taken verbatim (surrounding whitespace is stripped), and `ALLOW_DEV_API_KEY=true` opts into the
 fixed `dev-admin-key`; with neither set, the seed key is generated in the format above.
 
 ### Permission Model
 
 API keys carry **no permission strings**. Authorization is a role hierarchy on the key itself, plus
-two scoping dimensions enforced by `ApiKeyGuard`.
+three scoping dimensions enforced by `ApiKeyGuard`.
 
 | Role       | Rank | Meaning                                                              |
 | ---------- | ---- | -------------------------------------------------------------------- |
@@ -83,10 +83,11 @@ two scoping dimensions enforced by `ApiKeyGuard`.
 A route declares its minimum level with `@RequireRole(...)`; a key passes when its role ranks at or
 above that level (`AuthService.hasPermission`). A key below it is rejected with `403 Forbidden`.
 
-| Scope     | Field             | Effect                                                                                                   |
-| --------- | ----------------- | -------------------------------------------------------------------------------------------------------- |
-| Source IP | `allowedIps`      | Empty/absent = unrestricted; non-empty = fail-closed IP whitelist (see §4.3)                             |
-| Sessions  | `allowedSessions` | Empty/absent = every session; non-empty = a request carrying any other session id is rejected with `401` |
+| Scope     | Field             | Effect                                                                                                                                                             |
+| --------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Source IP | `allowedIps`      | Empty/absent = unrestricted; non-empty = fail-closed IP whitelist (see §4.3)                                                                                       |
+| Sessions  | `allowedSessions` | Empty/absent = every session; non-empty = a request carrying any other session id is rejected with `401`                                                           |
+| Chats     | `allowedChats`    | Empty/absent = every chat; non-empty = default-deny: only chat-scoped routes, and only for a listed chat, else `403`; `/events`, MCP and Bull Board refuse the key |
 
 The key-lifecycle routes (`/api/auth/api-keys`) are additionally fenced with `@RequireUnscopedKey()`:
 a session-scoped key is refused there whatever its role, so it cannot mint or widen credentials
@@ -269,31 +270,33 @@ All limits are **global and per client IP** (resolved through `TRUSTED_PROXIES`)
 
 TTL values are in milliseconds. The `/api/metrics` and `/api/health*` routes are exempt (`@SkipThrottle`). To enforce tighter per-route limits, lower the global windows or add a limiter at your reverse proxy.
 
+An IPv6 client is keyed on its /64, so rotating addresses inside one allocation does not mint fresh buckets. The same key is used by every other per-client limit: the MCP and Bull Board pre-auth throttles, the WebSocket limits below, the per-client share of the in-flight body budget, and the health route's auth-failure audit bound. `allowedIps` matching and audit rows still see the full address.
+
 ### Response on limit
 
-Exceeding a window returns `429 Too Many Requests`. Because the windows are **named** throttlers (`short` / `medium` / `long`), `@nestjs/throttler` suffixes every rate-limit header with the throttler name — there are no unsuffixed `Retry-After` or `X-RateLimit-*` headers:
+Exceeding a window returns `429 Too Many Requests`. Because the windows are **named** throttlers (`short` / `medium` / `long`), `@nestjs/throttler` suffixes every rate-limit header with the throttler name, so there are no unsuffixed `X-RateLimit-*` headers. `Retry-After` is the exception: on a `429` the guard emits the plain spelling too, because no HTTP client reads a suffixed one.
 
 - On success, each response carries one header triple per window: `X-RateLimit-Limit-short` / `-Remaining-short` / `-Reset-short`, plus the `-medium` and `-long` equivalents.
-- On `429`, the exceeded window sets `Retry-After-short`, `Retry-After-medium`, or `Retry-After-long` (seconds until the block expires) — read whichever is present rather than a plain `Retry-After`.
+- On `429`, the exceeded window sets `Retry-After-short`, `Retry-After-medium`, or `Retry-After-long` (seconds until the block expires), and the guard mirrors that value into a plain `Retry-After`. Read the plain one; the suffixed name is what tells an operator which window shed the request.
 
 The ingress route (`ALL /api/ingress/:pluginId/:instanceId/*path`) is exempt from the global per-IP tiers (their 100/min medium window sits below the per-instance limit, so a provider fanning every tenant's webhooks through one egress IP was shed before the per-instance bound could fire). It carries its own two windows instead, both on `INGRESS_INSTANCE_TTL` (default 60000 ms):
 
 - `instance`, keyed on `(pluginId, instanceId)`, env `INGRESS_INSTANCE_LIMIT`, default 120. Sheds one noisy tenant without touching its neighbours.
 - `ingress-ip`, keyed on the client (proxy-aware, see `TRUSTED_PROXIES`), env `INGRESS_IP_LIMIT`, default 1200. The `instance` key is built from path segments the caller supplies, so varying them mints a fresh bucket; this window is the bound an unauthenticated caller cannot walk around. It is sized 10x the per-instance default so it never binds first for legitimate traffic.
 
-Responses therefore carry `X-RateLimit-*-instance` and `X-RateLimit-*-ingress-ip`, and on saturation the `Retry-After-*` of whichever window shed the request.
+Responses therefore carry `X-RateLimit-*-instance` and `X-RateLimit-*-ingress-ip`, and on saturation the `Retry-After-*` of whichever window shed the request, mirrored into a plain `Retry-After`.
 
-The API exposes the rate-limit headers via CORS (`exposedHeaders`) so browser clients can read them. The simplest backpressure signal remains the `429` status itself, with the suffixed `Retry-After-*` as the retry delay.
+The API exposes the rate-limit headers via CORS (`exposedHeaders`) so browser clients can read them, the plain `Retry-After` included. The simplest backpressure signal remains the `429` status itself, with `Retry-After` as the retry delay.
 
 ### WebSocket (`/events`) limits
 
 Socket.IO frames never pass through the Nest enhancer pipeline, so the HTTP windows above do **not** apply to the WebSocket surface. `EventsGateway` enforces its own in-process limits instead (all keyed in-memory per process; any blank/non-positive/non-numeric env value falls back to the default):
 
-| Limit                                                               | Keyed on                                       | Default                                | Env overrides                                                       |
-| ------------------------------------------------------------------- | ---------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------- |
-| Client frames (subscribe/unsubscribe/ping) — token bucket           | API key (IP before auth completes)             | 60 frames/s sustained, 120-frame burst | `WS_RATE_LIMIT_FRAME_PER_SECOND` / `WS_RATE_LIMIT_FRAME_BURST`      |
-| New handshakes — sliding window, enforced **before** key validation | client IP (resolved through `TRUSTED_PROXIES`) | 10 per 60 s                            | `WS_RATE_LIMIT_HANDSHAKE_MAX` / `WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS` |
-| Simultaneous sockets                                                | API key                                        | 16                                     | `WS_MAX_SOCKETS_PER_KEY`                                            |
+| Limit                                                               | Keyed on                                                        | Default                                | Env overrides                                                       |
+| ------------------------------------------------------------------- | --------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------- |
+| Client frames (subscribe/unsubscribe/ping) — token bucket           | API key (IP, IPv6 on its /64, before auth completes)            | 60 frames/s sustained, 120-frame burst | `WS_RATE_LIMIT_FRAME_PER_SECOND` / `WS_RATE_LIMIT_FRAME_BURST`      |
+| New handshakes — sliding window, enforced **before** key validation | client IP (resolved through `TRUSTED_PROXIES`, IPv6 on its /64) | 10 per 60 s                            | `WS_RATE_LIMIT_HANDSHAKE_MAX` / `WS_RATE_LIMIT_HANDSHAKE_WINDOW_MS` |
+| Simultaneous sockets                                                | API key                                                         | 16                                     | `WS_MAX_SOCKETS_PER_KEY`                                            |
 
 The frame budget is sized ~6x above legitimate traffic: the dashboard emits ~8 subscribe frames at page mount and only occasional ping/unsubscribe frames afterwards (server→client event fan-out is not limited). The handshake window stops an unauthenticated connection flood from forcing a DB `validateApiKey` per attempt; Socket.IO's exponential-backoff reconnect (~6 attempts/min per tab) stays under it. The socket cap covers multi-tab dashboards and SDK clients sharing one key. A rejected handshake or excess socket is answered with a `RATE_LIMITED` error frame and a clean disconnect; an over-budget frame gets a `RATE_LIMITED` error frame and is not dispatched. Violations are audited as `rate_limit_exceeded`, sampled to at most one row per subject+kind per minute (suppressed occurrences are counted into the next row) so the audit trail itself cannot become the flood.
 
@@ -360,10 +363,14 @@ function signPayload(payload: object, secret: string): string {
 }
 
 // Client: Verify signature
-function verifySignature(payload: string, signature: string, secret: string): boolean {
+function verifySignature(payload: string, signature: string | undefined, secret: string): boolean {
+  if (typeof signature !== 'string') return false;
   const expected = 'sha256=' + crypto.createHmac('sha256', secret).update(payload).digest('hex');
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
 
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  // timingSafeEqual throws on a length mismatch, so a short or forged header must return false first.
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 ```
 
