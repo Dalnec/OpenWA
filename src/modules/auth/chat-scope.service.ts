@@ -1,4 +1,4 @@
-import { Injectable, Optional } from '@nestjs/common';
+import { ForbiddenException, Injectable, Optional } from '@nestjs/common';
 import { ApiKey } from './entities/api-key.entity';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
 import { ContactDirectory } from '../../engine/identity/jid-candidates';
@@ -35,6 +35,17 @@ export class ChatScopeService {
     return isChatScopeRestricted(apiKey?.allowedChats);
   }
 
+  /**
+   * Refuse a restricted key that names no chat on a route whose chat is an optional `?chatId=`. The
+   * guard fences the chat id when it is present; this closes the case where it is missing or blank,
+   * which the route would otherwise read as "every chat".
+   */
+  requireChat(apiKey: Pick<ApiKey, 'allowedChats'> | null | undefined, chatId: string | undefined): void {
+    if (this.isRestricted(apiKey) && !chatId?.trim()) {
+      throw new ForbiddenException('chatId is required for a key restricted to selected chats');
+    }
+  }
+
   /** The literal scope for a key (no lookups), or `null` when unrestricted. */
   scopeFor(apiKey?: Pick<ApiKey, 'allowedChats'> | null): ChatScope | null {
     return buildChatScope(apiKey?.allowedChats ?? null);
@@ -49,8 +60,18 @@ export class ChatScopeService {
   }
 
   /** The allowlist expanded once with the lid table (batched), for filtering a whole list. */
-  scopeForFilter(apiKey: Pick<ApiKey, 'allowedChats'> | null | undefined): Promise<ChatScope | null> {
+  scopeForFilter(apiKey?: Pick<ApiKey, 'allowedChats'> | null): Promise<ChatScope | null> {
     return buildExpandedChatScope(apiKey?.allowedChats ?? null, this.batchDirectory());
+  }
+
+  /**
+   * The expanded allowlist as a plain id array, for surfaces that filter at the query level
+   * (search's SQL `IN`), or `undefined` when the key is unrestricted. Same expansion as
+   * {@link scopeForFilter}: both stored dialects of every entry, lid twins included.
+   */
+  async idsForFilter(apiKey?: Pick<ApiKey, 'allowedChats'> | null): Promise<string[] | undefined> {
+    const scope = await this.scopeForFilter(apiKey);
+    return scope ? [...scope.allowed] : undefined;
   }
 
   /** The subset of `items` whose chat id is inside the key's fence (unrestricted ⇒ unchanged). */

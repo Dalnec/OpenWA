@@ -252,6 +252,27 @@ describe('PluginLoaderService — enable/config persistence', () => {
     loader2.registerBuiltInPlugin(manifest, {}, { apiKey: 'default' });
     expect(loader2.getPlugin('persist-test')?.config).toEqual({ apiKey: 'operator-secret' });
   });
+
+  it('persists only the keys a config update set, so other env-derived keys stay live', () => {
+    loader.registerBuiltInPlugin(manifest, {}, { execPath: '/old/chromium', headless: true });
+    loader.updatePluginConfig('persist-test', { apiKey: 'operator-secret' });
+    expect(loader.getPlugin('persist-test')?.config).toEqual({
+      execPath: '/old/chromium',
+      headless: true,
+      apiKey: 'operator-secret',
+    });
+    expect(storage.getPluginConfig('persist-test')).toEqual({ apiKey: 'operator-secret' });
+
+    // Restart with a changed env value: it wins, and the operator's key is still applied.
+    const storage2 = new PluginStorageService(config);
+    const loader2 = new PluginLoaderService(config, new HookManager(), storage2, {} as unknown as ModuleRef);
+    loader2.registerBuiltInPlugin(manifest, {}, { execPath: '/new/chromium', headless: true });
+    expect(loader2.getPlugin('persist-test')?.config).toEqual({
+      execPath: '/new/chromium',
+      headless: true,
+      apiKey: 'operator-secret',
+    });
+  });
 });
 
 describe('PluginLoaderService — engine mutual exclusion', () => {
@@ -377,6 +398,33 @@ describe('PluginLoaderService — graceful shutdown (onModuleDestroy)', () => {
     // The failing plugin's onDisable error didn't block the other from being disabled.
     expect(okDisable).toHaveBeenCalledTimes(1);
     expect(loader.getPlugin('ok-plg')?.status).toBe(PluginStatus.DISABLED);
+  });
+
+  it('waits for an enable already in flight and disables it, so its onDisable still runs', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => (release = resolve));
+    const onDisable = jest.fn(() => Promise.resolve());
+    loader.registerBuiltInPlugin(ext('slow-plg'), { onEnable: () => gate, onDisable });
+
+    const enabling = loader.enablePlugin('slow-plg');
+    const destroying = loader.onModuleDestroy();
+    release();
+    await enabling;
+    await destroying;
+
+    expect(onDisable).toHaveBeenCalledTimes(1);
+    expect(loader.getPlugin('slow-plg')?.status).toBe(PluginStatus.DISABLED);
+  });
+
+  it('refuses an enable once teardown has begun', async () => {
+    const onEnable = jest.fn(() => Promise.resolve());
+    loader.registerBuiltInPlugin(ext('late-plg'), { onEnable });
+
+    await loader.onModuleDestroy();
+
+    await expect(loader.enablePlugin('late-plg')).rejects.toThrow(/shutting down/);
+    expect(onEnable).not.toHaveBeenCalled();
+    expect(loader.getPlugin('late-plg')?.status).not.toBe(PluginStatus.ENABLED);
   });
 });
 

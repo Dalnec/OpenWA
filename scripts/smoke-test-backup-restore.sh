@@ -27,8 +27,7 @@
 #   (r) a symlinked state dir is archived by content and restored through the link, and an archive
 #       member that is itself a symlink is refused
 #   (s) restored state lands where the restored data/.env.generated points, below ./.env
-#   (t) ./.env lines with CRLF endings, blanks around = or trailing blanks resolve as dotenv reads them,
-#       and a `KEY: value` line is reported
+#   (t) ./.env lines with CRLF endings, blanks around = or trailing blanks resolve as dotenv reads them
 #   (u) a state, database or data-dir file target the restore cannot write stops it before any database
 #       is written (skipped as root)
 #   (v) a leftover STORAGE_LOCAL_PATH=./uploads the app cannot create falls back to ./data/media in
@@ -39,6 +38,23 @@
 #   (y) plugin packages in the legacy ./plugins, which the archive does not carry, are reported
 #   (z) a leftover ./uploads that was never created, beside an existing ./data/media, resolves there in
 #       both scripts whatever the uid
+#   (aa) engine auth state copied from a running app (an open whatsapp-web.js profile, Baileys state)
+#       is noted in the archive and printed by restore, which does not refuse it even with --strict
+#   (ab) a blank ./.env line keeps data/.env.generated from supplying the key, so the default applies
+#   (ac) a missing Baileys auth dir is reported when data/.env.generated selects the Baileys engine
+#   (ad) a file an engine deletes during the sessions/ or baileys/ copy is noted instead of failing the
+#       backup, a file the app deletes during the media or plugin copies is logged, and any other cp
+#       error still fails it, however long its output and whatever the host's locale
+#   (ae) the min-content check passes an archive whose listing outgrows a pipe buffer
+#   (af) the online SQLite backup waits out a writer holding the database lock (skipped without sqlite3)
+#   (ag) quoted values, inline comments and `KEY=""` in ./.env resolve as dotenv reads them, a NUL on
+#       another line does not hide the key, and a line the scripts cannot parse fails the lookup, so
+#       backup and restore stop before archiving or writing anything instead of using a default the app
+#       may not read
+#   (ah) pg_dump makes the app's TLS check when DATABASE_SSL=true (falling back to the system CA store
+#       without node), and connects as before when it is not
+#   (ai) ./data paths in .env.generated follow OPENWA_DATA_DIR in a run on the host, in both scripts,
+#       while non-path settings there are read as written
 #
 # Usage: ./scripts/smoke-test-backup-restore.sh
 # Requires: bash, tar, node (restore.sh path resolution). sqlite3 is optional (see (c) and (k)).
@@ -48,7 +64,9 @@ set -euo pipefail
 # would aim a case at a real install, and restore replaces the state directories wholesale, so every
 # case starts from none of them and sets exactly the paths it uses.
 unset OPENWA_DATA_DIR BACKUP_DIR DATABASE_TYPE MAIN_DATABASE_NAME DATABASE_NAME SESSION_DATA_PATH \
-  BAILEYS_AUTH_DIR STORAGE_LOCAL_PATH PLUGINS_DIR PLUGIN_STATE_DIR OPENWA_RESTORE_SNAPSHOT_DIR BOOTSTRAP_KEY_FILE
+  BAILEYS_AUTH_DIR STORAGE_LOCAL_PATH PLUGINS_DIR PLUGIN_STATE_DIR OPENWA_RESTORE_SNAPSHOT_DIR BOOTSTRAP_KEY_FILE \
+  ENGINE_TYPE DATABASE_URL DATABASE_HOST DATABASE_PORT DATABASE_USERNAME DATABASE_PASSWORD \
+  DATABASE_SSL DATABASE_SSL_REJECT_UNAUTHORIZED PGSSLMODE PGSSLROOTCERT
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP="$REPO_ROOT/scripts/backup.sh"
@@ -852,7 +870,7 @@ make_fixture "$T/src/live/store.sqlite" "tango-data"
 make_fixture "$T/src/data/main.sqlite" "STALE-main"
 make_fixture "$T/src/data/openwa.sqlite" "STALE-data"
 printf 'tango-session\n' >"$T/src/data/sess/session-s1/marker"
-printf 'MAIN_DATABASE_NAME = %s\r\nDATABASE_NAME=%s\r\nSESSION_DATA_PATH=./data/sess  \r\nBAILEYS_AUTH_DIR: ./data/bl\r\n' \
+printf 'MAIN_DATABASE_NAME = %s\r\nDATABASE_NAME=%s\r\nSESSION_DATA_PATH=./data/sess  \r\n' \
   "$T/src/live/auth.sqlite" "$T/src/live/store.sqlite" >"$T/src/.env"
 set +e
 OUT_T="$(cd "$T/src" && BACKUP_DIR="$T/out" "$BACKUP" 2>&1)"
@@ -871,9 +889,6 @@ if [ "$(db_fingerprint "$T/extract/openwa.sqlite")" != "tango-data" ]; then
 fi
 if [ "$(cat "$T/extract/sessions/session-s1/marker" 2>/dev/null || true)" != "tango-session" ]; then
   fail "(t) a SESSION_DATA_PATH with trailing blanks did not resolve to the sessions dir"
-fi
-if ! printf '%s' "$OUT_T" | grep -q 'sets BAILEYS_AUTH_DIR in a form these scripts do not parse'; then
-  fail "(t) a \`KEY: value\` line was skipped without the warning"
 fi
 printf 'DATABASE_NAME=./data/custom.sqlite\r\nMAIN_DATABASE_NAME = ./data/custom-main.sqlite  \r\n' >"$T/dst/.env"
 make_fixture "$T/dst/data/custom.sqlite" "tango-live"
@@ -897,7 +912,7 @@ fi
 if [ -n "$(find "$T/dst/data" -name "*$(printf '\r')*" 2>/dev/null)" ]; then
   fail "(t) restore created a file whose name ends in a carriage return"
 fi
-pass "(t) CRLF, spaced and blank-padded ./.env lines resolve like dotenv, and \`KEY: value\` is reported"
+pass "(t) CRLF, spaced and blank-padded ./.env lines resolve like dotenv"
 
 echo ""
 echo "==> (u) a target the restore cannot write stops it before any database is written"
@@ -1172,6 +1187,651 @@ if [ "$(cat "$Z/dst/data/media/a.jpg" 2>/dev/null || true)" != "zulu-media" ] ||
   fail "(z) restore did not put the media back under ./data/media: $OUT_Z"
 fi
 pass "(z) a never-created ./uploads beside ./data/media resolves to ./data/media without a uid check"
+
+echo ""
+echo "==> (aa) engine auth state copied from a running app is noted, and restore does not refuse it"
+# The databases are snapshotted consistently online, but sessions/ and baileys/ are plain copies of
+# directories the engines keep writing, and the runbook called the online backup impact-free. The
+# note has its own marker: --strict gates only the database one, or it would refuse every online backup.
+AA="$WORK/aa"
+mkdir -p "$AA/src/data/sessions/session-s1" "$AA/src/data/sessions/session-s2" "$AA/src/data/baileys/s1" \
+  "$AA/dst" "$AA/quiet/data/sessions/session-s1"
+make_fixture "$AA/src/data/main.sqlite" "alpha2-main"
+make_fixture "$AA/src/data/openwa.sqlite" "alpha2-data"
+printf 'profile\n' >"$AA/src/data/sessions/session-s1/Preferences"
+printf 'profile\n' >"$AA/src/data/sessions/session-s2/Preferences"
+ln -s host-123 "$AA/src/data/sessions/session-s1/SingletonLock"
+printf '{}' >"$AA/src/data/baileys/s1/creds.json"
+OUT_AA="$(cd "$AA/src" && BACKUP_DIR="$AA/out" "$BACKUP" 2>&1)"
+ARCHIVE_AA="$(ls "$AA"/out/openwa-backup-*.tar.gz)"
+NOTE_AA="$(tar -xOzf "$ARCHIVE_AA" ./ENGINE-STATE-NOTE 2>/dev/null || true)"
+if ! printf '%s\n' "$NOTE_AA" | grep -q 'open or left by a killed browser: session-s1)' ||
+  ! printf '%s\n' "$NOTE_AA" | grep -q '^baileys/'; then
+  fail "(aa) the archive does not note the open profile and the Baileys state: $NOTE_AA"
+fi
+# Without sqlite3 the same archive carries CONSISTENCY-WARNING, so the engine note must not vouch
+# for the databases.
+if printf '%s\n' "$NOTE_AA" | grep -qi 'consistent snapshot'; then
+  fail "(aa) the engine note claims the databases are consistent: $NOTE_AA"
+fi
+if ! printf '%s' "$OUT_AA" | grep -q 'may have been written during the copy'; then
+  fail "(aa) backup did not warn that engine auth state may have been written during the copy: $OUT_AA"
+fi
+if ! tar -tvzf "$ARCHIVE_AA" | grep -q '^l.*session-s1/SingletonLock'; then
+  fail "(aa) the profile lock was not archived as the symlink it is"
+fi
+# Without sqlite3 the databases are plain-copied and --strict rightly refuses on that marker.
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  OUT_AA="$(cd "$AA/dst" && "$RESTORE" "$ARCHIVE_AA" --strict 2>&1)" ||
+    fail "(aa) restore --strict refused an archive whose only note is the engine one: $OUT_AA"
+else
+  OUT_AA="$(cd "$AA/dst" && "$RESTORE" "$ARCHIVE_AA" 2>&1)" || fail "(aa) restore failed: $OUT_AA"
+fi
+if ! printf '%s' "$OUT_AA" | grep -q 'ENGINE-STATE-NOTE; engine auth state may have been copied' ||
+  ! printf '%s' "$OUT_AA" | grep -q 'session-s1'; then
+  fail "(aa) restore did not print the engine state note: $OUT_AA"
+fi
+# No open profile and no Baileys state: nothing to note.
+make_fixture "$AA/quiet/data/main.sqlite" "alpha2-quiet-main"
+make_fixture "$AA/quiet/data/openwa.sqlite" "alpha2-quiet-data"
+printf 'profile\n' >"$AA/quiet/data/sessions/session-s1/Preferences"
+(cd "$AA/quiet" && BACKUP_DIR="$AA/quiet-out" "$BACKUP" >/dev/null 2>&1)
+if tar -tzf "$(ls "$AA"/quiet-out/openwa-backup-*.tar.gz)" | grep -q 'ENGINE-STATE-NOTE'; then
+  fail "(aa) an archive with no open profile and no Baileys state carries the engine note"
+fi
+pass "(aa) live engine auth state is noted in the archive and printed, never refused"
+
+echo ""
+echo "==> (ab) a blank line in ./.env hides the key from data/.env.generated, as it does in the app"
+# dotenv sets a blank ./.env line to '' and never overwrites a key that is already set, so the app
+# reads its built-in default and never sees .env.generated's value. Falling through to that value
+# archived a database the app does not use, and the run exited 0.
+AB="$WORK/ab"
+mkdir -p "$AB/data" "$AB/elsewhere" "$AB/extract"
+make_fixture "$AB/data/main.sqlite" "bravo2-main"
+make_fixture "$AB/data/openwa.sqlite" "bravo2-default"
+make_fixture "$AB/elsewhere/openwa.sqlite" "WRONG-data"
+printf 'DATABASE_NAME=\n' >"$AB/.env"
+printf 'DATABASE_NAME=%s\n' "$AB/elsewhere/openwa.sqlite" >"$AB/data/.env.generated"
+(cd "$AB" && BACKUP_DIR="$AB/out" "$BACKUP" >/dev/null 2>&1)
+tar -xzf "$(ls "$AB"/out/openwa-backup-*.tar.gz)" -C "$AB/extract"
+if [ "$(db_fingerprint "$AB/extract/openwa.sqlite")" != "bravo2-default" ]; then
+  fail "(ab) a blank DATABASE_NAME in ./.env fell through to data/.env.generated"
+fi
+pass "(ab) a blank ./.env line stops the lookup and the built-in default applies"
+
+echo ""
+echo "==> (ac) a Baileys engine chosen in the dashboard is warned about when its auth dir is missing"
+# Compose forwards a blank ENGINE_TYPE and the dashboard saves the real one in data/.env.generated, so
+# reading the environment alone never saw Baileys there and skipped the re-pairing warning.
+AC="$WORK/ac"
+mkdir -p "$AC/data"
+make_fixture "$AC/data/main.sqlite" "charlie2-main"
+make_fixture "$AC/data/openwa.sqlite" "charlie2-data"
+printf 'ENGINE_TYPE=baileys\n' >"$AC/data/.env.generated"
+OUT_AC="$(cd "$AC" && ENGINE_TYPE='' BACKUP_DIR="$AC/out" "$BACKUP" 2>&1)"
+if ! printf '%s' "$OUT_AC" | grep -q 'ENGINE_TYPE=baileys but .* was not found'; then
+  fail "(ac) a dashboard-selected Baileys engine with no auth dir was not reported: $OUT_AC"
+fi
+pass "(ac) the missing Baileys auth dir is reported when data/.env.generated selects Baileys"
+
+echo ""
+echo "==> (ad) a file the engine deletes during the state copy notes the copy instead of failing the backup"
+# Chromium and the Baileys auth store delete and rename files while they run, so cp can list a file
+# that is gone when it opens it. Under set -e that aborted the online backup with no archive. The shim
+# cp copies for real, then reports the error a vanished file gives; any other cp error stays fatal.
+AD="$WORK/ad"
+mkdir -p "$AD/data/sessions/session-s1" "$AD/data/baileys/s1" "$AD/data/media" "$AD/data/plugins" "$AD/shim"
+make_fixture "$AD/data/main.sqlite" "delta2-main"
+make_fixture "$AD/data/openwa.sqlite" "delta2-data"
+printf 'profile\n' >"$AD/data/sessions/session-s1/Preferences"
+printf '{}' >"$AD/data/baileys/s1/creds.json"
+printf 'jpeg\n' >"$AD/data/media/status.jpg"
+printf '{}' >"$AD/data/plugins/registry.json"
+# SHIM_CP_LINES repeats the error past a pipe buffer, the size of a real tree's worth of failures. Without
+# LC_ALL=C the vanished-file text comes out translated, as cp prints it on a localized host.
+cat >"$AD/shim/cp" <<SHIM
+#!/bin/sh
+$(command -v cp) "\$@" || exit
+msg="\$SHIM_CP_ERROR"
+if [ "\${LC_ALL:-}" != C ] && [ "\$msg" = 'No such file or directory' ]; then
+  msg='Datei oder Verzeichnis nicht gefunden'
+fi
+case "\$3" in
+  */sessions | */baileys | */media | */plugin-*)
+    i=0
+    while [ "\$i" -lt "\${SHIM_CP_LINES:-1}" ]; do
+      echo "cp: cannot stat '\$2/gone\$i': \$msg" >&2
+      i=\$((i + 1))
+    done
+    exit 1
+    ;;
+esac
+SHIM
+chmod +x "$AD/shim/cp"
+set +e
+OUT_AD="$(cd "$AD" && SHIM_CP_ERROR='No such file or directory' PATH="$AD/shim:$PATH" BACKUP_DIR="$AD/out" "$BACKUP" 2>&1)"
+RC_AD=$?
+set -e
+if [ "$RC_AD" -ne 0 ]; then
+  fail "(ad) a file that vanished during the engine state copy failed the backup: $OUT_AD"
+fi
+NOTE_AD="$(tar -xOzf "$(ls "$AD"/out/openwa-backup-*.tar.gz)" ./ENGINE-STATE-NOTE 2>/dev/null || true)"
+if ! printf '%s\n' "$NOTE_AD" | grep -q '^sessions/ (files changed during the copy)' ||
+  ! printf '%s\n' "$NOTE_AD" | grep -q '^baileys/ (files changed during the copy)'; then
+  fail "(ad) the archive does not note the state copies that changed underneath: $NOTE_AD"
+fi
+for tree in media plugins; do
+  if ! printf '%s\n' "$OUT_AD" | grep -q "WARN: files under .*/$tree changed during the copy"; then
+    fail "(ad) the backup did not log the $tree copy that changed underneath: $OUT_AD"
+  fi
+done
+set +e
+OUT_AD="$(cd "$AD" && SHIM_CP_ERROR='Permission denied' SHIM_CP_LINES=20000 PATH="$AD/shim:$PATH" \
+  BACKUP_DIR="$AD/out2" "$BACKUP" 2>&1)"
+RC_AD=$?
+set -e
+if [ "$RC_AD" -eq 0 ] || ! grep -q 'Permission denied' <<<"$OUT_AD" ||
+  [ -n "$(ls "$AD"/out2/openwa-backup-*.tar.gz 2>/dev/null)" ]; then
+  fail "(ad) a cp error other than a vanished file did not fail the backup: $(tail -n 5 <<<"$OUT_AD")"
+fi
+pass "(ad) a vanished engine file is noted, a vanished media or plugin file logged, other cp errors fatal"
+
+echo ""
+echo "==> (ae) the min-content check passes an archive whose listing outgrows a pipe buffer"
+# A whatsapp-web.js profile alone lists thousands of members. A grep -q that matched a required member
+# early and stopped reading broke the pipe feeding it, and pipefail turned the match into "missing", so a
+# good archive was deleted. The shim tar pads the listing after the real members, past a pipe buffer.
+AE="$WORK/ae"
+mkdir -p "$AE/data" "$AE/shim"
+make_fixture "$AE/data/main.sqlite" "echo2-main"
+make_fixture "$AE/data/openwa.sqlite" "echo2-data"
+cat >"$AE/shim/tar" <<SHIM
+#!/bin/sh
+$(command -v tar) "\$@" || exit
+if [ "\$1" = -tzf ]; then
+  i=0
+  while [ "\$i" -lt 20000 ]; do
+    echo "./sessions/session-s1/Default/Cache/Cache_Data/padding-\$i"
+    i=\$((i + 1))
+  done
+fi
+SHIM
+chmod +x "$AE/shim/tar"
+set +e
+OUT_AE="$(cd "$AE" && PATH="$AE/shim:$PATH" BACKUP_DIR="$AE/out" "$BACKUP" 2>&1)"
+RC_AE=$?
+set -e
+if [ "$RC_AE" -ne 0 ] || [ -z "$(ls "$AE"/out/openwa-backup-*.tar.gz 2>/dev/null)" ]; then
+  fail "(ae) a long archive listing failed the min-content check: $(grep -v padding- <<<"$OUT_AE")"
+fi
+pass "(ae) the min-content check reads the whole listing"
+
+echo ""
+if [ "$HAS_SQLITE3" -eq 1 ]; then
+  echo "==> (af) the online SQLite backup waits out a writer holding the database lock"
+  # The app writes several times a second in rollback-journal mode. A bare .backup gave up on the first
+  # lock it met with 'database is locked', so on a busy gateway no online backup completed.
+  AF="$WORK/af"
+  mkdir -p "$AF/data"
+  make_fixture "$AF/data/main.sqlite" "foxtrot2-main"
+  make_fixture "$AF/data/openwa.sqlite" "foxtrot2-data"
+  {
+    echo 'BEGIN EXCLUSIVE;'
+    echo "INSERT INTO sentinel VALUES('foxtrot2-late');"
+    echo ".system touch '$AF/locked'"
+    sleep 2
+    echo 'COMMIT;'
+  } | sqlite3 "$AF/data/main.sqlite" &
+  WRITER_AF=$!
+  for _ in $(seq 1 100); do
+    [ -f "$AF/locked" ] && break
+    sleep 0.1
+  done
+  [ -f "$AF/locked" ] || fail "(af) the writer never took the database lock"
+  set +e
+  OUT_AF="$(cd "$AF" && BACKUP_DIR="$AF/out" "$BACKUP" 2>&1)"
+  RC_AF=$?
+  set -e
+  wait "$WRITER_AF"
+  if [ "$RC_AF" -ne 0 ]; then
+    fail "(af) the backup failed while a writer held the database lock: $OUT_AF"
+  fi
+  mkdir -p "$AF/extract"
+  tar -xzf "$(ls "$AF"/out/openwa-backup-*.tar.gz)" -C "$AF/extract"
+  if [ "$(sqlite3 "$AF/extract/main.sqlite" 'PRAGMA integrity_check;')" != ok ]; then
+    fail "(af) the snapshot taken after the writer let go is not a sound database"
+  fi
+  pass "(af) the online backup waits for the lock instead of failing"
+else
+  echo "SKIP: (af) sqlite3 not found on this host, so there is no database lock to wait on"
+fi
+
+echo ""
+echo "==> (ag) quoted, commented and empty-quoted ./.env values resolve as the app reads them, and others stop the run"
+# dotenv strips a value's quotes and an unquoted value's comment, and a key it has set keeps
+# data/.env.generated from supplying it. The scripts skipped every such line and read the next layer,
+# so .env.example's commented PLUGINS_DIR line and a `DATABASE_NAME=""` resolved to values the app
+# never uses. A line the scripts cannot parse used to resolve to the default with a warning, so a
+# backup archived a stale database at the default path, or no media, and still exited 0.
+AG="$WORK/ag"
+mkdir -p "$AG/data"
+cat >"$AG/.env" <<'ENV'
+PLUGINS_DIR=./data/plugins          # Plugin directory (default: ./data/plugins)
+DATABASE_NAME=""
+MAIN_DATABASE_NAME='./data/quoted main.sqlite'
+BAILEYS_AUTH_DIR=./data/bl#inline
+SESSION_DATA_PATH="./data/sess" # quoted, then a comment
+STORAGE_LOCAL_PATH="./data/media" # see "docs"
+PLUGIN_STATE_DIR='./data/state' # it'
+ENGINE_TYPE: baileys
+BOOTSTRAP_KEY_FILE="./data/key\file"
+ENV
+printf 'DATABASE_NAME=./elsewhere/openwa.sqlite\nSESSION_DATA_PATH=./elsewhere/sess\n' >"$AG/data/.env.generated"
+resolve_ag() {
+  (cd "$AG" && DATA_DIR=./data && . "$REPO_ROOT/scripts/lib-env.sh" && openwa_resolve "$1" "$2") 2>>"$AG/err"
+}
+# A blank value resolves to the default, never to data/.env.generated.
+for check in 'PLUGINS_DIR|./data/plugins' 'DATABASE_NAME|DEFAULT' 'MAIN_DATABASE_NAME|./data/quoted main.sqlite' \
+  'BAILEYS_AUTH_DIR|./data/bl'; do
+  key="${check%%|*}"
+  got="$(resolve_ag "$key" DEFAULT)"
+  if [ "$got" != "${check#*|}" ]; then
+    fail "(ag) $key resolved to '$got', expected '${check#*|}'"
+  fi
+done
+# An unparsed line fails the lookup and prints no value: neither the default nor data/.env.generated.
+# A comment ending in the value's own quote must not pass for the closing quote.
+for key in SESSION_DATA_PATH STORAGE_LOCAL_PATH PLUGIN_STATE_DIR ENGINE_TYPE BOOTSTRAP_KEY_FILE; do
+  set +e
+  got="$(resolve_ag "$key" DEFAULT)"
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ] || [ -n "$got" ]; then
+    fail "(ag) $key in a form the scripts cannot parse resolved to '$got' (rc $rc) instead of failing"
+  fi
+  if ! grep -q "sets $key in a form" "$AG/err"; then
+    fail "(ag) the parse error did not name $key: $(cat "$AG/err")"
+  fi
+done
+if [ "$(grep -c 'do not parse' "$AG/err")" -ne 5 ]; then
+  fail "(ag) the parse error did not name exactly the five unparsed lines: $(cat "$AG/err")"
+fi
+
+# Both scripts stop on such a line before archiving or writing anything. The data store sits at a
+# custom path while a stale database is left at the default one, which the backup used to archive.
+AGB="$WORK/ag-backup"
+mkdir -p "$AGB/data/media" "$AGB/dst/data"
+make_fixture "$AGB/data/main.sqlite" "ag-main"
+make_fixture "$AGB/data/active.sqlite" "ag-active"
+make_fixture "$AGB/data/openwa.sqlite" "ag-STALE"
+(cd "$AGB" && BACKUP_DIR="$AGB/good" "$BACKUP" >/dev/null 2>&1) || fail "(ag) the fixture backup failed"
+ARCHIVE_AG="$(ls "$AGB"/good/openwa-backup-*.tar.gz)"
+for line in 'DATABASE_NAME="./data/active.sqlite" # data store' \
+  'DATABASE_TYPE="postgres" # migrated' \
+  'STORAGE_LOCAL_PATH="./data/media" # local disk'; do
+  key="${line%%[=:]*}"
+  printf '%s\n' "$line" >"$AGB/.env"
+  set +e
+  OUT_AG="$(cd "$AGB" && BACKUP_DIR="$AGB/out" "$BACKUP" 2>&1)"
+  RC_AG=$?
+  set -e
+  if [ "$RC_AG" -eq 0 ]; then
+    fail "(ag) backup exited 0 with an unparsed $key line: $OUT_AG"
+  fi
+  if ! grep -q "sets $key in a form" <<<"$OUT_AG"; then
+    fail "(ag) backup did not name $key: $OUT_AG"
+  fi
+  if [ -n "$(ls "$AGB/out" 2>/dev/null)" ]; then
+    fail "(ag) backup left an archive behind for an unparsed $key line"
+  fi
+  if [ "$key" = DATABASE_TYPE ]; then
+    continue # restore does not read it
+  fi
+  printf '%s\n' "$line" >"$AGB/dst/.env"
+  set +e
+  OUT_AG="$(cd "$AGB/dst" && "$RESTORE" "$ARCHIVE_AG" --force 2>&1)"
+  RC_AG=$?
+  set -e
+  if [ "$RC_AG" -eq 0 ] || ! grep -q "sets $key in a form" <<<"$OUT_AG"; then
+    fail "(ag) restore did not stop on an unparsed $key line (rc $RC_AG): $OUT_AG"
+  fi
+  if [ -n "$(ls "$AGB/dst/data")" ]; then
+    fail "(ag) restore wrote into the target before stopping on an unparsed $key line"
+  fi
+done
+# dotenv also reads a line behind a byte-order mark or a Unicode blank, trims a no-break space off a
+# value and takes a bare CR for a line break. grep's [[:space:]] does not, so each of these used to
+# resolve to the stale default and archive it with exit 0. dotenv reads a byte that is not UTF-8 as
+# U+FFFD, which grep in a UTF-8 locale skipped the line for, and bash drops a NUL from the value.
+for line in '\357\273\277DATABASE_NAME=./data/active.sqlite' '\302\240DATABASE_NAME=./data/active.sqlite' \
+  'DATABASE_NAME=./data/active.sqlite\302\240' 'LOG_LEVEL=info\rDATABASE_NAME=./data/active.sqlite' \
+  'DATABASE_NAME=./data/active.sqlite # donn\351es' 'DATABASE_NAME=./data/act\000ive.sqlite' \
+  'DATABASE_NAME\302\240=./data/active.sqlite' 'DATABASE_NAME=\342\200\257./data/active.sqlite' \
+  'DATABASE_NAME=./data/active.sqlite\343\200\200 # data store' '# note\342\200\250DATABASE_NAME=./data/active.sqlite'; do
+  # shellcheck disable=SC2059 # the line's escapes are the point
+  printf "$line\n" >"$AGB/.env"
+  set +e
+  OUT_AG="$(cd "$AGB" && BACKUP_DIR="$AGB/out" "$BACKUP" 2>&1)"
+  RC_AG=$?
+  set -e
+  if [ "$RC_AG" -eq 0 ] || [ -n "$(ls "$AGB/out" 2>/dev/null)" ] ||
+    ! grep -q 'on a line naming DATABASE_NAME' <<<"$OUT_AG"; then
+    fail "(ag) backup did not stop on $line (rc $RC_AG): $OUT_AG"
+  fi
+done
+# A NUL elsewhere in the file made grep treat it as binary and print nothing, so the default was used.
+printf 'LOG_LEVEL=a\000b\nDATABASE_NAME=./data/active.sqlite\n' >"$AGB/.env"
+OUT_AG="$(cd "$AGB" && BACKUP_DIR="$AGB/nul" "$BACKUP" 2>&1)" || fail "(ag) backup failed with a NUL on another line of ./.env"
+# bash 4.4 and later warn about a NUL in a command substitution's output, which reads like a fault.
+if grep -q 'null byte' <<<"$OUT_AG"; then
+  fail "(ag) a NUL on the line before DATABASE_NAME leaked a shell warning: $OUT_AG"
+fi
+rm -rf "$AGB/x" && mkdir -p "$AGB/x"
+tar -xzf "$(ls "$AGB"/nul/openwa-backup-*.tar.gz)" -C "$AGB/x"
+if [ "$(db_fingerprint "$AGB/x/openwa.sqlite")" != "ag-active" ]; then
+  fail "(ag) a NUL on another line of ./.env archived '$(db_fingerprint "$AGB/x/openwa.sqlite")' instead of the configured data store"
+fi
+# None of these stop the run, as none changes what the app reads: a comment or another key's value
+# naming the key holds a no-break space or a Latin-1 byte, the key's own inline comment or the middle
+# of its value holds a Unicode blank, or a bare `export KEY` follows the key's line, which dotenv skips.
+# ENGINE_TYPE only gates a warning, so a line the scripts cannot parse skips the warning, not the backup.
+make_fixture "$AGB/data/act"$'\343\200\200'"ive.sqlite" "ag-active"
+for content in 'DATABASE_NAME=./data/active.sqlite\nexport DATABASE_NAME' \
+  '# DATABASE_NAME\302\240is the data store\nDATABASE_NAME=./data/active.sqlite' \
+  '# DATABASE_NAME: donn\351es\nDATABASE_NAME=./data/active.sqlite' \
+  'NOTE=see DATABASE_NAME\302\240below\nDATABASE_NAME=./data/active.sqlite' \
+  'DATABASE_NAME=./data/active.sqlite # primary\302\240store' 'DATABASE_NAME=./data/act\343\200\200ive.sqlite' \
+  'DATABASE_NAME=./data/active.sqlite\nENGINE_TYPE: baileys'; do
+  # shellcheck disable=SC2059 # the line's escapes are the point
+  printf "$content\n" >"$AGB/.env"
+  rm -rf "$AGB/kept" "$AGB/x" && mkdir -p "$AGB/x"
+  set +e
+  OUT_AG="$(cd "$AGB" && BACKUP_DIR="$AGB/kept" "$BACKUP" 2>&1)"
+  RC_AG=$?
+  set -e
+  if [ "$RC_AG" -ne 0 ]; then
+    fail "(ag) backup stopped on $content (rc $RC_AG): $OUT_AG"
+  fi
+  tar -xzf "$(ls "$AGB"/kept/openwa-backup-*.tar.gz)" -C "$AGB/x"
+  if [ "$(db_fingerprint "$AGB/x/openwa.sqlite")" != "ag-active" ]; then
+    fail "(ag) $content archived '$(db_fingerprint "$AGB/x/openwa.sqlite")' instead of the configured data store"
+  fi
+done
+if ! grep -q 'sets ENGINE_TYPE in a form' <<<"$OUT_AG" || ! grep -q 'skipping only the check for missing Baileys state' <<<"$OUT_AG"; then
+  fail "(ag) backup did not report the ENGINE_TYPE line it cannot parse and that it carried on: $OUT_AG"
+fi
+rm -f "$AGB/data/act"$'\343\200\200'"ive.sqlite"
+# dotenv reads the line after a bare `NAME:` line as NAME's value, so the app never sets the key from it.
+printf 'LOG_LEVEL:\nDATABASE_NAME=./data/active.sqlite\n' >"$AGB/.env"
+set +e
+OUT_AG="$(cd "$AGB" && BACKUP_DIR="$AGB/out" "$BACKUP" 2>&1)"
+RC_AG=$?
+set -e
+if [ "$RC_AG" -eq 0 ] || [ -n "$(ls "$AGB/out" 2>/dev/null)" ] ||
+  ! grep -q 'just before a line setting DATABASE_NAME' <<<"$OUT_AG"; then
+  fail "(ag) backup did not stop on a DATABASE_NAME line right after a bare LOG_LEVEL: line (rc $RC_AG): $OUT_AG"
+fi
+# dotenv's `KEY\s*=` and the quoted value after an empty `KEY=` cross line breaks, and dotenv starts a
+# line after U+2028, so each of these sets the key for the app, or hides its line, from another line.
+# The scripts used to read the default or the hidden line, and archived it with exit 0.
+for check in 'DATABASE_NAME\n=./data/active.sqlite|names DATABASE_NAME on a line without an =' \
+  'DATABASE_NAME=./data/openwa.sqlite\nexport DATABASE_NAME\n\n=./data/active.sqlite|names DATABASE_NAME on a line without an =' \
+  'DATABASE_NAME=\n\n"./data/active.sqlite"|leaves DATABASE_NAME empty on its line' \
+  '# note\342\200\250LOG_LEVEL:\nDATABASE_NAME=./data/active.sqlite|just before a line setting DATABASE_NAME'; do
+  # shellcheck disable=SC2059 # the line's escapes are the point
+  printf "${check%%|*}\n" >"$AGB/.env"
+  set +e
+  OUT_AG="$(cd "$AGB" && BACKUP_DIR="$AGB/out" "$BACKUP" 2>&1)"
+  RC_AG=$?
+  set -e
+  if [ "$RC_AG" -eq 0 ] || [ -n "$(ls "$AGB/out" 2>/dev/null)" ] || ! grep -q "${check#*|}" <<<"$OUT_AG"; then
+    fail "(ag) backup did not stop on ${check%%|*} (rc $RC_AG): $OUT_AG"
+  fi
+done
+# dotenv can take the backslash and quote that end a quoted value for an escaped quote, and read on to a
+# quote on a later line.
+printf '%s\n' "DATABASE_NAME='./data/active.sqlite\\'" "'" >"$AGB/.env"
+set +e
+OUT_AG="$(cd "$AGB" && DATA_DIR=./data && . "$REPO_ROOT/scripts/lib-env.sh" && openwa_resolve DATABASE_NAME DEFAULT 2>&1)"
+RC_AG=$?
+set -e
+if [ "$RC_AG" -eq 0 ] || ! grep -q 'ending in a backslash' <<<"$OUT_AG"; then
+  fail "(ag) a quoted DATABASE_NAME ending in a backslash did not fail the lookup (rc $RC_AG): $OUT_AG"
+fi
+# An empty `KEY=` followed by blank lines and an unquoted line stays empty for dotenv too.
+printf 'DATABASE_NAME=\n\n# data store\nLOG_LEVEL=info\n' >"$AGB/.env"
+if [ "$(cd "$AGB" && DATA_DIR=./data && . "$REPO_ROOT/scripts/lib-env.sh" && openwa_resolve DATABASE_NAME DEFAULT)" != DEFAULT ]; then
+  fail "(ag) an empty DATABASE_NAME= followed by a comment and another key did not resolve to the default"
+fi
+# A quoted value holding its own quote character is named as such, and the remedy warns that double
+# quotes expand \n and \r. The other quote style, which the error suggests, archives the configured store.
+make_fixture "$AGB/data/o'brien.sqlite" "ag-active"
+printf '%s\n' "DATABASE_NAME='./data/o'brien.sqlite'" >"$AGB/.env"
+set +e
+OUT_AG="$(cd "$AGB" && BACKUP_DIR="$AGB/out" "$BACKUP" 2>&1)"
+RC_AG=$?
+set -e
+if [ "$RC_AG" -eq 0 ] || ! grep -q 'containing its own quote character' <<<"$OUT_AG" ||
+  ! grep -q 'turns \\n and \\r into line breaks' <<<"$OUT_AG"; then
+  fail "(ag) backup did not stop on a single-quoted value holding a single quote with that cause named (rc $RC_AG): $OUT_AG"
+fi
+printf '%s\n' "DATABASE_NAME=\"./data/o'brien.sqlite\"" >"$AGB/.env"
+(cd "$AGB" && BACKUP_DIR="$AGB/quote-fix" "$BACKUP" >/dev/null 2>&1) || fail "(ag) backup failed with the value in the other quote style"
+rm -rf "$AGB/x" "$AGB/data/o'brien.sqlite" && mkdir -p "$AGB/x"
+tar -xzf "$(ls "$AGB"/quote-fix/openwa-backup-*.tar.gz)" -C "$AGB/x"
+if [ "$(db_fingerprint "$AGB/x/openwa.sqlite")" != "ag-active" ]; then
+  fail "(ag) the other quote style archived '$(db_fingerprint "$AGB/x/openwa.sqlite")' instead of the configured data store"
+fi
+# The Postgres connection keys are resolved where a failure stops the run, before pg_dump starts.
+mkdir -p "$AGB/bin"
+printf '#!/bin/sh\necho dumped >"%s/pg_dump-ran"\n' "$AGB" >"$AGB/bin/pg_dump"
+chmod +x "$AGB/bin/pg_dump"
+printf 'DATABASE_TYPE=postgres\nDATABASE_HOST="db.internal" # primary\n' >"$AGB/.env"
+set +e
+OUT_AG="$(cd "$AGB" && PATH="$AGB/bin:$PATH" BACKUP_DIR="$AGB/out" "$BACKUP" 2>&1)"
+RC_AG=$?
+set -e
+if [ "$RC_AG" -eq 0 ] || [ -e "$AGB/pg_dump-ran" ] || ! grep -q 'sets DATABASE_HOST in a form' <<<"$OUT_AG"; then
+  fail "(ag) backup dumped the default Postgres host past an unparsed DATABASE_HOST line (rc $RC_AG): $OUT_AG"
+fi
+# DATABASE_NAME is the SQLite data store's path or the Postgres database's name, so a line for it the
+# scripts cannot parse stops neither a Postgres backup that dumps DATABASE_URL nor the restore of a
+# PostgreSQL archive, neither of which reads it.
+printf 'DATABASE_TYPE=postgres\nDATABASE_NAME="openwa" # primary\n' >"$AGB/.env"
+set +e
+OUT_AG="$(cd "$AGB" && PATH="$AGB/bin:$PATH" DATABASE_URL=postgres://db.internal/openwa BACKUP_DIR="$AGB/pg" "$BACKUP" 2>&1)"
+RC_AG=$?
+set -e
+if [ "$RC_AG" -ne 0 ] || [ ! -e "$AGB/pg_dump-ran" ] || ! tar -tzf "$(ls "$AGB"/pg/openwa-backup-*.tar.gz)" | grep -qx './database.sql'; then
+  fail "(ag) a Postgres backup through DATABASE_URL stopped on a DATABASE_NAME line it does not use (rc $RC_AG): $OUT_AG"
+fi
+rm -rf "$AGB/pgdst" && mkdir -p "$AGB/pgdst/data"
+printf 'DATABASE_NAME="openwa" # primary\n' >"$AGB/pgdst/.env"
+set +e
+OUT_AG="$(cd "$AGB/pgdst" && "$RESTORE" "$(ls "$AGB"/pg/openwa-backup-*.tar.gz)" --force 2>&1)"
+RC_AG=$?
+set -e
+if [ "$RC_AG" -ne 0 ] || [ ! -f "$AGB/pgdst/data/database.sql" ] || [ "$(db_fingerprint "$AGB/pgdst/data/main.sqlite")" != "ag-main" ]; then
+  fail "(ag) restoring a PostgreSQL archive stopped on a DATABASE_NAME line it does not use (rc $RC_AG): $OUT_AG"
+fi
+# The remedies the error gives work: the key in the environment wins over the unparsed line, and the
+# same quoted value with its comment on its own line parses. Either way the configured store is archived.
+AG_LINE='DATABASE_NAME="./data/active.sqlite" # data store'
+printf '%s\n' "$AG_LINE" >"$AGB/.env"
+(cd "$AGB" && DATABASE_NAME=./data/active.sqlite BACKUP_DIR="$AGB/env-fix" "$BACKUP" >/dev/null 2>&1) ||
+  fail "(ag) backup failed with DATABASE_NAME passed in the environment over an unparsed line"
+printf '# data store\nDATABASE_NAME="./data/active.sqlite"\n' >"$AGB/.env"
+(cd "$AGB" && BACKUP_DIR="$AGB/line-fix" "$BACKUP" >/dev/null 2>&1) || fail "(ag) backup failed with the comment on its own line"
+for dir in env-fix line-fix; do
+  rm -rf "$AGB/x" && mkdir -p "$AGB/x"
+  tar -xzf "$(ls "$AGB/$dir"/openwa-backup-*.tar.gz)" -C "$AGB/x"
+  if [ "$(db_fingerprint "$AGB/x/openwa.sqlite")" != "ag-active" ]; then
+    fail "(ag) the $dir backup archived '$(db_fingerprint "$AGB/x/openwa.sqlite")' instead of the configured data store"
+  fi
+done
+# A line that only data/.env.generated holds stops the run as well, and so does one in the archive's
+# copy, which a restore reads in place of the target's.
+rm -f "$AGB/.env"
+printf '%s\n' "$AG_LINE" >"$AGB/data/.env.generated"
+set +e
+OUT_AG="$(cd "$AGB" && BACKUP_DIR="$AGB/out" "$BACKUP" 2>&1)"
+RC_AG=$?
+set -e
+if [ "$RC_AG" -eq 0 ] || [ -n "$(ls "$AGB/out" 2>/dev/null)" ] ||
+  ! grep -q '\.env\.generated sets DATABASE_NAME in a form' <<<"$OUT_AG" ||
+  ! grep -q 'Move a comment to its own' <<<"$OUT_AG"; then
+  fail "(ag) backup did not stop on an unparsed DATABASE_NAME line in data/.env.generated (rc $RC_AG): $OUT_AG"
+fi
+(cd "$AGB" && DATABASE_NAME=./data/active.sqlite BACKUP_DIR="$AGB/gen" "$BACKUP" >/dev/null 2>&1) ||
+  fail "(ag) backup failed with DATABASE_NAME passed in the environment over data/.env.generated"
+rm -f "$AGB/data/.env.generated" "$AGB/dst/.env"
+set +e
+OUT_AG="$(cd "$AGB/dst" && "$RESTORE" "$(ls "$AGB"/gen/openwa-backup-*.tar.gz)" --force 2>&1)"
+RC_AG=$?
+set -e
+if [ "$RC_AG" -eq 0 ] || [ -n "$(ls "$AGB/dst/data")" ] ||
+  ! grep -q '\.env\.generated sets DATABASE_NAME in a form' <<<"$OUT_AG"; then
+  fail "(ag) restore did not stop on an unparsed DATABASE_NAME line in the archive's .env.generated (rc $RC_AG): $OUT_AG"
+fi
+if ! grep -q "come from the archive's .env.generated" <<<"$OUT_AG"; then
+  fail "(ag) restore did not name the archive's .env.generated as the source of its paths: $OUT_AG"
+fi
+(cd "$AGB/dst" && DATABASE_NAME=./data/active.sqlite "$RESTORE" "$(ls "$AGB"/gen/openwa-backup-*.tar.gz)" --force >/dev/null 2>&1) ||
+  fail "(ag) restore failed with DATABASE_NAME passed in the environment over the archive's .env.generated"
+if [ "$(db_fingerprint "$AGB/dst/data/active.sqlite")" != "ag-active" ] || [ -e "$AGB/dst/data/openwa.sqlite" ]; then
+  fail "(ag) restore with DATABASE_NAME in the environment did not land on the configured data store only"
+fi
+pass "(ag) dotenv's quoted, commented and empty forms resolve like the app, and an unparsed line stops both scripts"
+
+echo ""
+echo "==> (ah) pg_dump makes the app's TLS check when DATABASE_SSL=true"
+# libpq defaults to sslmode=prefer: it falls back to plaintext and takes any certificate, so a dump of
+# a database the app reaches over verified TLS sent its password to whoever answered. The shim pg_dump
+# records the TLS settings it was started with and whether its root certificate file held any CA.
+AH="$WORK/ah"
+mkdir -p "$AH/data" "$AH/shim"
+make_fixture "$AH/data/main.sqlite" "hotel2-main"
+cat >"$AH/shim/pg_dump" <<'SHIM'
+#!/bin/sh
+certs=none
+[ -f "${PGSSLROOTCERT:-}" ] && certs="$(grep -c 'BEGIN CERTIFICATE' "$PGSSLROOTCERT")"
+echo "mode=${PGSSLMODE:-} root=${PGSSLROOTCERT:-} certs=$certs" >"$AH_LOG"
+echo '-- dump'
+SHIM
+chmod +x "$AH/shim/pg_dump"
+# backup_ah <.env.generated content> [env assignments...]: the TLS settings pg_dump ran with. The
+# backup's output is kept in out.log.
+backup_ah() {
+  printf '%b' "$1" >"$AH/data/.env.generated"
+  shift
+  rm -rf "$AH/out"
+  if ! OUT_AH="$(cd "$AH" && env "$@" AH_LOG="$AH/log" PATH="$AH/shim:$PATH" BACKUP_DIR="$AH/out" \
+    "$BACKUP" 2>&1)"; then
+    fail "(ah) the backup failed: $OUT_AH"
+  fi
+  printf '%s\n' "$OUT_AH" >"$AH/out.log"
+  cat "$AH/log"
+}
+PG_AH='DATABASE_TYPE=postgres\n'
+if [ "$(backup_ah "$PG_AH")" != "mode= root= certs=none" ]; then
+  fail "(ah) pg_dump got TLS settings without DATABASE_SSL: $(cat "$AH/log")"
+fi
+GOT_AH="$(backup_ah "${PG_AH}DATABASE_SSL=true\n")"
+if ! [[ "$GOT_AH" =~ ^mode=verify-full\ root=(/[^ ]+)\ certs=([0-9]+)$ ]]; then
+  fail "(ah) DATABASE_SSL=true did not verify the server against a root certificate file: $GOT_AH"
+fi
+# Node's CA set runs to well over a hundred roots; the file holding it is removed with the staging copy.
+if [ "${BASH_REMATCH[2]}" -lt 100 ] || [ -e "${BASH_REMATCH[1]}" ]; then
+  fail "(ah) the root certificates were not Node's CA set, or were left behind: $GOT_AH"
+fi
+if [ "$(backup_ah "${PG_AH}DATABASE_SSL=true\nDATABASE_SSL_REJECT_UNAUTHORIZED=false\n" \
+  DATABASE_URL=postgres://openwa@db/openwa)" != "mode=require root= certs=none" ]; then
+  fail "(ah) DATABASE_SSL_REJECT_UNAUTHORIZED=false did not encrypt without verifying: $(cat "$AH/log")"
+fi
+if [ "$(backup_ah "${PG_AH}DATABASE_SSL=true\n" PGSSLROOTCERT="$AH/ca.pem")" != \
+  "mode=verify-full root=$AH/ca.pem certs=none" ] ||
+  [ "$(backup_ah "${PG_AH}DATABASE_SSL=true\n" PGSSLMODE=verify-ca)" != "mode=verify-ca root= certs=none" ]; then
+  fail "(ah) an operator's PGSSLROOTCERT or PGSSLMODE was not honoured: $(cat "$AH/log")"
+fi
+# Without node there is no CA set to write: libpq's system store is used, and the log says what it needs.
+mkdir -p "$AH/nonode"
+populate_shim "$AH/nonode"
+ln -sf "$(command -v tail)" "$AH/nonode/tail"
+ln -sf "$AH/shim/pg_dump" "$AH/nonode/pg_dump"
+if [ "$(PATH="$AH/nonode" backup_ah "${PG_AH}DATABASE_SSL=true\n")" != "mode=verify-full root=system certs=none" ] ||
+  ! grep -q 'node not found.*sslrootcert=system.*libpq 16+' "$AH/out.log"; then
+  fail "(ah) without node the system CA store was not used, or the log gave no hint: $(cat "$AH/out.log")"
+fi
+pass "(ah) pg_dump verifies the server under DATABASE_SSL=true and is unchanged without it"
+echo "==> (ai) ./data paths in .env.generated follow OPENWA_DATA_DIR in a run on the host"
+# The app writes STORAGE_LOCAL_PATH=./data/media on first run, and a dashboard save adds
+# SESSION_DATA_PATH=./data/sessions, both relative to /app in the image. Run on the host with
+# OPENWA_DATA_DIR at the volume's mountpoint, the scripts read them against the host's working
+# directory: the backup left the volume's media and sessions out, or took a stale ./data there, and
+# exited 0, and the restore put them where the app never reads them.
+AI="$WORK/ai"
+mkdir -p "$AI/vol/media" "$AI/vol/sessions/session-1" "$AI/host/data/media" "$AI/vol2" "$AI/x"
+make_fixture "$AI/vol/main.sqlite" "ai-main"
+make_fixture "$AI/vol/openwa.sqlite" "ai-data"
+printf 'ai-media\n' >"$AI/vol/media/a.jpg"
+printf 'ai-session\n' >"$AI/vol/sessions/session-1/marker"
+printf 'host-stale\n' >"$AI/host/data/media/stale.jpg"
+# The database paths come from the same file here, so they follow the volume too.
+printf '%s\n' STORAGE_LOCAL_PATH=./data/media SESSION_DATA_PATH=./data/sessions \
+  MAIN_DATABASE_NAME=./data/main.sqlite DATABASE_NAME=./data/openwa.sqlite >"$AI/vol/.env.generated"
+(cd "$AI/host" && OPENWA_DATA_DIR="$AI/vol" BACKUP_DIR="$AI/out" "$BACKUP" >/dev/null 2>&1) ||
+  fail "(ai) backup from the host failed"
+ARCHIVE_AI="$(ls "$AI"/out/openwa-backup-*.tar.gz)"
+tar -xzf "$ARCHIVE_AI" -C "$AI/x"
+if [ "$(db_fingerprint "$AI/x/main.sqlite")" != "ai-main" ] ||
+  [ "$(db_fingerprint "$AI/x/openwa.sqlite")" != "ai-data" ]; then
+  fail "(ai) backup did not archive the volume's databases"
+fi
+if [ "$(cat "$AI/x/media/a.jpg" 2>/dev/null || true)" != "ai-media" ] || [ -e "$AI/x/media/stale.jpg" ]; then
+  fail "(ai) backup did not archive the volume's media: $(find "$AI/x/media" 2>&1 | tr '\n' ' ')"
+fi
+if [ "$(cat "$AI/x/sessions/session-1/marker" 2>/dev/null || true)" != "ai-session" ]; then
+  fail "(ai) backup did not archive the volume's sessions"
+fi
+(cd "$AI/host" && OPENWA_DATA_DIR="$AI/vol2" "$RESTORE" "$ARCHIVE_AI" >/dev/null 2>&1) ||
+  fail "(ai) restore from the host failed"
+if [ "$(cat "$AI/vol2/media/a.jpg" 2>/dev/null || true)" != "ai-media" ] ||
+  [ "$(cat "$AI/vol2/sessions/session-1/marker" 2>/dev/null || true)" != "ai-session" ] ||
+  [ "$(db_fingerprint "$AI/vol2/main.sqlite" 2>/dev/null || true)" != "ai-main" ] ||
+  [ "$(db_fingerprint "$AI/vol2/openwa.sqlite" 2>/dev/null || true)" != "ai-data" ]; then
+  fail "(ai) restore did not put media, sessions and databases in the volume"
+fi
+if [ "$(ls -A "$AI/host/data")" != media ] || [ "$(ls -A "$AI/host/data/media")" != stale.jpg ]; then
+  fail "(ai) restore wrote into the host's working directory: $(find "$AI/host/data" | tr '\n' ' ')"
+fi
+# A leftover ./uploads falls back to the volume's media as well, not to the host's ./data/media.
+printf 'STORAGE_LOCAL_PATH=./uploads\n' >"$AI/vol/.env.generated"
+(
+  cd "$AI/host"
+  MAIN_DATABASE_NAME="$AI/vol/main.sqlite" DATABASE_NAME="$AI/vol/openwa.sqlite" \
+    OPENWA_DATA_DIR="$AI/vol" BACKUP_DIR="$AI/out-uploads" "$BACKUP" >/dev/null 2>&1
+) || fail "(ai) backup with a leftover ./uploads failed"
+if ! tar -tzf "$(ls "$AI"/out-uploads/openwa-backup-*.tar.gz)" | grep -qx './media/a.jpg'; then
+  fail "(ai) a leftover ./uploads did not fall back to the volume's media"
+fi
+# Only path settings are mapped: a dashboard-provisioned Postgres named, owned or reached as "data", or
+# a password under "data/", reaches pg_dump as written, with the default data dir too.
+mkdir -p "$AI/pg/data" "$AI/pg/bin"
+make_fixture "$AI/pg/data/main.sqlite" "ai-pg-main"
+cat >"$AI/pg/bin/pg_dump" <<EOF
+#!/bin/sh
+printf '%s|' "\$PGPASSWORD" "\$@" >"$AI/pg/pg_dump-args"
+EOF
+chmod +x "$AI/pg/bin/pg_dump"
+printf 'DATABASE_TYPE=postgres\nDATABASE_HOST=data\nDATABASE_USERNAME=data\nDATABASE_PASSWORD=data/s3cret\nDATABASE_NAME=data\n' \
+  >"$AI/pg/data/.env.generated"
+(cd "$AI/pg" && PATH="$AI/pg/bin:$PATH" BACKUP_DIR="$AI/pg/out" "$BACKUP" >/dev/null 2>&1) ||
+  fail "(ai) Postgres backup with settings named data failed"
+if [ "$(cat "$AI/pg/pg_dump-args" 2>/dev/null || true)" != "data/s3cret|-h|data|-p|5432|-U|data|data|" ]; then
+  fail "(ai) Postgres settings from .env.generated were rewritten: $(cat "$AI/pg/pg_dump-args" 2>&1)"
+fi
+pass "(ai) a host run backs up and restores the volume's databases, media and sessions, not the working directory's"
 
 echo ""
 echo "All smoke tests passed!"

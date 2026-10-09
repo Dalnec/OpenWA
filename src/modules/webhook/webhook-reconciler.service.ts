@@ -3,7 +3,8 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Webhook } from './entities/webhook.entity';
 import { WebhookOutboxService } from './webhook-outbox.service';
-import { WebhookDeliveryService } from './webhook-delivery.service';
+import { isAbortedBackoff, WebhookDeliveryService } from './webhook-delivery.service';
+import { isDeliverableWebhook } from './utils/deliver-once';
 import { createLogger } from '../../common/services/logger.service';
 import { resolveNonNegativeIntEnv } from '../../config/configuration';
 
@@ -59,7 +60,12 @@ export interface WebhookReconcileStats {
 export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = createLogger('WebhookReconcilerService');
   private timer?: ReturnType<typeof setInterval>;
-  private sweeping = false;
+  // The pass in flight, settled when it ends; doubles as the overlap guard.
+  private inFlight?: Promise<void>;
+  // Aborted on destroy: stops the pass at the next row and the replay in hand before its next retry.
+  // A row already past its last check, or a retry POST already started, still sends that one POST.
+  private readonly stop = new AbortController();
+  private cursor?: string;
 
   constructor(
     @InjectRepository(Webhook, 'data') private readonly webhooks: Repository<Webhook>,
@@ -70,7 +76,7 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
   onModuleInit(): void {
     const opts = resolveWebhookReconcilerOptions();
     if (opts.intervalMs <= 0) {
-      this.logger.log('Webhook delivery reconciler disabled (WEBHOOK_RECONCILE_INTERVAL_MS <= 0)');
+      this.logger.log('Webhook delivery reconciler disabled (WEBHOOK_RECONCILE_INTERVAL_MS=0)');
       return;
     }
     this.timer = setInterval(() => {
@@ -81,19 +87,36 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
     this.timer.unref?.();
   }
 
-  onModuleDestroy(): void {
+  /**
+   * Clearing the interval only stops the NEXT pass. A replay holds no dispatch slot, so the delivery
+   * drain neither waits for nor stops a pass already running: it would go on POSTing after the drain,
+   * and after PluginLoaderService has unregistered the `webhook:before` hooks. Stop it at the next row,
+   * stop the replay in hand without a further retry, and wait for it.
+   */
+  async onModuleDestroy(): Promise<void> {
+    this.stop.abort();
     if (this.timer) clearInterval(this.timer);
+    await this.inFlight;
   }
 
   /** One bounded pass over the stranded backlog. Overlap-guarded. */
   async sweep(opts: WebhookReconcilerOptions, now: Date = new Date()): Promise<WebhookReconcileStats> {
     const stats: WebhookReconcileStats = { scanned: 0, replayed: 0, failed: 0, skipped: 0 };
-    if (this.sweeping) return stats;
-    this.sweeping = true;
+    if (this.inFlight || this.stop.signal.aborted) return stats;
+    let settle!: () => void;
+    this.inFlight = new Promise(resolve => (settle = resolve));
     try {
-      const rows = await this.outbox.findStale(new Date(now.getTime() - opts.graceMs), opts.batchSize);
+      const cutoff = new Date(now.getTime() - opts.graceMs);
+      let rows = await this.outbox.findStale(cutoff, opts.batchSize, this.cursor);
+      if (rows.length === 0 && this.cursor) {
+        this.cursor = undefined;
+        rows = await this.outbox.findStale(cutoff, opts.batchSize);
+      }
+      // Live jobs may occupy a whole page. Advance past them without spending their replay budget.
+      this.cursor = rows.at(-1)?.id;
       stats.scanned = rows.length;
       for (const row of rows) {
+        if (this.stop.signal.aborted) break;
         if (this.delivery.isLocallyPending(row.idempotencyKey)) {
           // Still owned by a dispatch on this node (parked in the limiter or mid retry loop), so it
           // is slow rather than stranded. Replaying it would POST alongside the original and outside
@@ -101,20 +124,30 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
           stats.skipped++;
           continue;
         }
-        if (row.attempts >= opts.maxAttempts) {
-          // Budget spent: stop replaying and leave the failure row as the recovery path.
-          await this.outbox.close(row.webhookId, row.idempotencyKey, 'failed');
-          stats.failed++;
-          continue;
-        }
         const webhook = await this.webhooks.findOne({ where: { id: row.webhookId } });
-        if (!webhook || !webhook.active) {
-          // The subscription is gone or switched off; replaying it would deliver an event the
-          // operator has already unsubscribed from.
+        if (!isDeliverableWebhook(webhook, row.event, row.sessionId)) {
+          // The subscription is gone, switched off or no longer lists this event; replaying it would
+          // deliver an event the operator has already unsubscribed from. Same test as the queue
+          // processor applies before every attempt.
           await this.outbox.close(row.webhookId, row.idempotencyKey, 'failed');
           stats.skipped++;
           continue;
         }
+        if (row.deliveryId && (await this.delivery.isQueueJobPending(row.deliveryId))) {
+          stats.skipped++;
+          continue;
+        }
+        if (row.attempts >= opts.maxAttempts) {
+          // A database fault may have prevented every terminal failure write. Keep the outbox
+          // payload until this handoff succeeds, without sending beyond the replay budget.
+          if (await this.delivery.recordReplayExhaustion(row, webhook.url)) {
+            await this.outbox.close(row.webhookId, row.idempotencyKey, 'failed');
+          }
+          stats.failed++;
+          continue;
+        }
+        // Shutdown may have begun during the lookups above; stop before spending budget or POSTing.
+        if (this.stop.signal.aborted) break;
         if (!(await this.outbox.countAttempt(row.id, row.attempts))) {
           // Settled since the batch was read, typically a local dispatch that finished while an
           // earlier row in this pass was replaying. The copy in hand is stale; replaying it duplicates.
@@ -132,26 +165,33 @@ export class WebhookReconcilerService implements OnModuleInit, OnModuleDestroy {
             row.event,
             row.idempotencyKey,
             row.payload,
+            { signal: this.stop.signal },
           );
-          if (outcome === 'failed') {
+          if (outcome === 'failed' || outcome === 'unrecorded') {
             // Left 'pending' on purpose: the next sweep retries it until the budget is spent.
             this.logger.warn(`Replay of ${row.event} to webhook ${row.webhookId} did not deliver`);
             stats.failed++;
             continue;
           }
-          // 'delivered', 'enqueued' and 'cancelled' all retire the row: the delivery either reached a
-          // durable owner or a plugin dropped it on purpose. Only 'failed' is worth another sweep.
-          await this.outbox.close(row.webhookId, row.idempotencyKey, 'dispatched');
+          // Enqueued rows retain their copy until the worker settles them. Success and deliberate
+          // cancellation can retire immediately.
+          if (outcome !== 'enqueued') await this.outbox.close(row.webhookId, row.idempotencyKey, 'dispatched');
           stats.replayed++;
         } catch (error) {
-          // An exception is an unexpected fault rather than a delivery failure; the row stays
-          // pending either way.
+          // A replay cut short in its retry backoff by shutdown was interrupted, not failed. Any other
+          // exception is an unexpected fault rather than a delivery failure. The row stays pending.
+          if (isAbortedBackoff(error, this.stop.signal)) {
+            this.logger.log(`Replay of ${row.event} to webhook ${row.webhookId} interrupted by shutdown`);
+            stats.skipped++;
+            continue;
+          }
           this.logger.warn(`Replay of ${row.event} to webhook ${row.webhookId} failed: ${String(error)}`);
           stats.failed++;
         }
       }
     } finally {
-      this.sweeping = false;
+      this.inFlight = undefined;
+      settle();
     }
     return stats;
   }

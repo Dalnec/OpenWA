@@ -1,3 +1,4 @@
+import { ForbiddenException } from '@nestjs/common';
 import { ChatScopeService } from './chat-scope.service';
 import { FindOperator, Repository } from 'typeorm';
 import { LidMappingStoreService } from '../../engine/identity/lid-mapping-store.service';
@@ -21,6 +22,17 @@ function fakeStore(): LidMappingStoreService {
 }
 
 describe('ChatScopeService', () => {
+  it('requireChat refuses a restricted key that names no chat, and nothing else', () => {
+    const svc = new ChatScopeService();
+    const restricted = { allowedChats: ['1@c.us'] };
+    for (const chatId of [undefined, '', '   ']) {
+      expect(() => svc.requireChat(restricted, chatId)).toThrow(ForbiddenException);
+    }
+    expect(() => svc.requireChat(restricted, '1@c.us')).not.toThrow();
+    expect(() => svc.requireChat({ allowedChats: null }, undefined)).not.toThrow();
+    expect(() => svc.requireChat(undefined, undefined)).not.toThrow();
+  });
+
   it('is unrestricted without an allowlist', async () => {
     const svc = new ChatScopeService();
     expect(svc.isRestricted({ allowedChats: null })).toBe(false);
@@ -48,6 +60,16 @@ describe('ChatScopeService', () => {
     const rows = [{ id: '123@g.us' }, { id: `${LID}@lid` }, { id: '999@g.us' }];
     expect(await svc.filter({ allowedChats: [`${PHONE}@c.us`] }, rows, r => r.id)).toEqual([{ id: `${LID}@lid` }]);
     expect(await svc.filter({ allowedChats: null }, rows, r => r.id)).toEqual(rows);
+  });
+
+  it('idsForFilter returns the expanded id array, or undefined when unrestricted', async () => {
+    const svc = new ChatScopeService(fakeStore());
+    const ids = await svc.idsForFilter({ allowedChats: [`${PHONE}@c.us`, '120@g.us'] });
+    expect(ids).toEqual(expect.arrayContaining([`${PHONE}@c.us`, `${PHONE}@s.whatsapp.net`, `${LID}@lid`, '120@g.us']));
+    expect(await svc.idsForFilter({ allowedChats: null })).toBeUndefined();
+    expect(await svc.idsForFilter({ allowedChats: [] })).toBeUndefined();
+    expect(await svc.idsForFilter({ allowedChats: ['not-a-chat'] })).toEqual([]);
+    expect(await svc.idsForFilter(undefined)).toBeUndefined();
   });
 
   it('does not admit a phone whose lid another node has re-mapped', async () => {
