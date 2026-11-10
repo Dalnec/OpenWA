@@ -1,5 +1,9 @@
 jest.mock('qrcode', () => ({ toDataURL: jest.fn() }));
-jest.mock('@whiskeysockets/baileys', () => ({ __esModule: true, initAuthCreds: jest.fn() }));
+jest.mock('@whiskeysockets/baileys', () => ({
+  __esModule: true,
+  initAuthCreds: jest.fn(),
+  makeCacheableSignalKeyStore: jest.fn((keys: unknown) => keys),
+}));
 jest.mock('./baileys-auth-store', () => ({
   useAtomicMultiFileAuthState: jest.fn().mockRejectedValue(new Error('stop after auth load')),
 }));
@@ -9,6 +13,7 @@ import { EngineStatus } from '../interfaces/whatsapp-engine.interface';
 import * as BaileysLib from '@whiskeysockets/baileys';
 import { useAtomicMultiFileAuthState } from './baileys-auth-store';
 import { BaileysLifecycle, type BaileysLifecycleHost } from './baileys-lifecycle';
+import type { BaileysVersionResolver, ResolveOptions } from './baileys-version-resolver';
 
 describe('BaileysLifecycle.connect', () => {
   it('loads the auth state through the atomic store with the session auth dir, library and logger', async () => {
@@ -50,6 +55,7 @@ describe('BaileysLifecycle unlink cleanup', () => {
     } as unknown as BaileysLifecycleHost;
     const sock = {
       user: { id: '628999:1@s.whatsapp.net' },
+      authState: { creds: { me: { id: '628999:1@s.whatsapp.net' }, account: {} } },
       query: jest.fn().mockResolvedValue({ tag: 'iq' }),
       generateMessageTag: () => 'tag-1',
       end: jest.fn(),
@@ -193,6 +199,7 @@ describe('BaileysLifecycle proxy fetch dispatcher', () => {
     const engine = new BaileysLifecycle(host);
     engine.sock = {
       user: { id: '628999:1@s.whatsapp.net' },
+      authState: { creds: { me: { id: '628999:1@s.whatsapp.net' }, account: {} } },
       query: jest.fn().mockResolvedValue({ tag: 'iq' }),
       generateMessageTag: () => 'tag-1',
       end: jest.fn(),
@@ -233,5 +240,89 @@ describe('BaileysLifecycle proxy fetch dispatcher', () => {
     expect(fresh).toBeDefined();
     expect(fresh).not.toBe(dispatcher);
     await fresh?.close();
+  });
+
+  describe('teardown while connecting', () => {
+    const settle = () => new Promise(resolve => setImmediate(resolve));
+    function connecting() {
+      const engine = lifecycle();
+      engine.sock = null;
+      type AuthState = Awaited<ReturnType<typeof useAtomicMultiFileAuthState>>;
+      let releaseAuth: ((value: AuthState) => void) | undefined;
+      jest.mocked(useAtomicMultiFileAuthState).mockImplementationOnce(
+        () =>
+          new Promise<AuthState>(resolve => {
+            releaseAuth = resolve;
+          }),
+      );
+      const resolver = (engine as unknown as { versionResolver: BaileysVersionResolver }).versionResolver;
+      const resolve = jest.spyOn(resolver, 'resolve');
+      const authRequested = async () => {
+        while (!releaseAuth) await settle();
+      };
+      const loadAuth = () =>
+        releaseAuth?.({ state: { creds: {}, keys: {} }, saveCreds: jest.fn() } as unknown as AuthState);
+      return { engine, resolve, authRequested, loadAuth };
+    }
+
+    // Opening the auth state creates the session's directory, which a deleted session no longer has.
+    it('does not open the auth state when the session stops while the library loads', async () => {
+      const engine = lifecycle();
+      engine.sock = null;
+      let finishLibrary: (lib: typeof BaileysLib) => void = () => undefined;
+      jest.spyOn(engine, 'loadLib').mockReturnValueOnce(
+        new Promise<typeof BaileysLib>(resolve => {
+          finishLibrary = resolve;
+        }),
+      );
+      jest.mocked(useAtomicMultiFileAuthState).mockClear();
+      const init = engine.initialize();
+      await engine.destroy();
+      finishLibrary(BaileysLib);
+      await init;
+
+      expect(useAtomicMultiFileAuthState).not.toHaveBeenCalled();
+      expect(engine.sock).toBeNull();
+    });
+
+    // The teardown closed the only dispatcher there was; a lookup after it would build one nothing
+    // closes and send a stopped session's requests through its proxy.
+    it('skips the version lookup when the session stops while its auth state loads', async () => {
+      const { engine, resolve, authRequested, loadAuth } = connecting();
+      const init = engine.initialize();
+      await authRequested();
+      await engine.disconnect();
+      loadAuth();
+      await init;
+
+      expect(resolve).not.toHaveBeenCalled();
+      expect((engine as unknown as { dispatcher?: unknown }).dispatcher).toBeUndefined();
+      expect(engine.sock).toBeNull();
+    });
+
+    it('aborts the version lookup when the session stops during it', async () => {
+      const { engine, resolve, authRequested, loadAuth } = connecting();
+      let signal: AbortSignal | undefined;
+      let finish: ((version: [number, number, number]) => void) | undefined;
+      resolve.mockImplementationOnce(
+        (_lib, options?: ResolveOptions) =>
+          new Promise(done => {
+            signal = options?.signal;
+            finish = done;
+          }),
+      );
+      const init = engine.initialize();
+      await authRequested();
+      loadAuth();
+      while (!finish) await settle();
+      expect(signal?.aborted).toBe(false);
+
+      await engine.destroy();
+
+      expect(signal?.aborted).toBe(true);
+      finish([2, 3000, 1]);
+      await init;
+      expect(engine.sock).toBeNull();
+    });
   });
 });
